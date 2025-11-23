@@ -62,19 +62,62 @@
  * having an empty buffer, and in that case the best thing is pretend like you're starting up again in the variance
  * case, so wait until you have 1
  *
- * TODO: we still need a solution for an overflowing client buffer and how we deal with that...
+ * TODO: we still need a solution for an overflowing client buffer and how we deal with that... Probably if it gets too
+ * large we should process or remove a bunch at once to bring it back down.
  *
+ */
+
+/**
+ * @brief A networked periodic signal quantizer for processing and emitting server states at a controlled rate.
+ *
+ * This templated class buffers states received from a server and emits them at a regular interval
+ * defined by an internal `PeriodicSignal`. It is designed to take incoming server data that is being sent at a fixed
+ * rate, but due to network variance might not be received at a steady rate, and act as an adapter that takes this noisy
+ * signal and actually emits the data at a fixed frequency by buffering a few elements so there is always something to
+ * grab.
+ *
+ * @warn This does not solve the issue when the internet connection is lost for a few seconds or anything like that, as
+ * it only buffers a few elements, in such cases the buffer will be depleted and then the output emitter will output
+ * nullopt values in the output emitter
+ *
+ *
+ * @tparam T The type of the server state to be buffered and emitted.
+ *
+ * @details
+ * The class maintains a deque of received states (`received_server_states`) and uses a `Stopwatch`
+ * (`empirical_server_signal_stopwatch`) to measure the actual arrival times of these states. It emits
+ * quantized output signals via a `SignalEmitter` (`output_emitter`) according to a `PeriodicSignal`
+ * (`quantized_output_signal`). The class also tracks whether the buffer was empty on the previous update
+ * and computes an exponential moving average of the buffer size for monitoring purposes.
+ *
+ * Usage:
+ * - Call `push()` whenever a new server state arrives.
+ * - Call `update()` periodically to process and emit buffered states at the quantized rate.
+ * - Use `get_missed_emit_percentage()` and `get_average_received_server_states_size()` for metrics.
+ *
+ * @note
+ * The first pushed state initializes the quantized signal timing.
  */
 template <typename T> class NetworkedPeriodicSignalQuantizer {
   public:
-    explicit NetworkedPeriodicSignalQuantizer(size_t capacity = 10)
-        : was_empty_on_last_update(false), received_server_states(10) {}
+    explicit NetworkedPeriodicSignalQuantizer() : was_empty_on_last_update(false) {}
 
     std::deque<T> received_server_states;
-    Stopwatch empirical_server_signal_stopwatch;
 
-    PeriodicSignal quantized_output_signal{60};
+    /** @brief Stopwatch used to measure the timing statistics of when we receive states from the server  */
+    Stopwatch received_state_stopwatch;
+
+    /**
+     * @brief the clean smooth output signal that is used to drive the emitter
+     * @note you can use get get_cycle_progess to see how close we are to the next signal, which can be used for
+     * interpolation purposess
+     */
+    PeriodicSignal output_signal{60};
+    /// @brief the emitter which you should bind to receive the states
     SignalEmitter output_emitter;
+
+    bool pushed_first_element = false;
+    bool logging_enabled = false;
 
     math_utils::ExponentialMovingAverage average_received_server_states_size;
 
@@ -82,9 +125,19 @@ template <typename T> class NetworkedPeriodicSignalQuantizer {
      * @brief Push a new state into the buffer.
      */
     void push(const T &item) {
+        LogSection _(global_logger, "npsq push", logging_enabled);
+
         received_server_states.push_back(item);
-        empirical_server_signal_stopwatch.press();
-        empirical_server_signal_stopwatch.get_micro_stats();
+        received_state_stopwatch.press();
+
+        if (not pushed_first_element) {
+            pushed_first_element = true;
+            output_signal.restart();
+        }
+
+        global_logger.debug("size is now: {}", received_server_states.size());
+
+        received_state_stopwatch.get_micro_stats();
         // TODO: adjust the quantlized output signal to match the server micro mean period
     }
 
@@ -92,41 +145,44 @@ template <typename T> class NetworkedPeriodicSignalQuantizer {
      * @brief Call periodically to emit states at the proper rate.
      */
     void update() {
-        LogSection _(global_logger, "npsq update");
+        LogSection _(global_logger, "npsq update", logging_enabled);
+
+        if (not pushed_first_element)
+            return;
 
         average_received_server_states_size.add_sample(static_cast<double>(received_server_states.size()));
 
-        if (quantized_output_signal.enough_time_has_passed()) {
+        if (output_signal.process_and_get_signal()) {
             total_emit_opportunities++;
-        }
 
-        if (received_server_states.empty()) {
-            if (quantized_output_signal.enough_time_has_passed()) {
+            std::optional<T> emitted_value = std::nullopt;
+
+            if (received_server_states.empty()) {
                 global_logger.debug("would've emitted a signal but the received states was empty, this is suboptimal "
                                     "because we won't be emitting the signal");
                 missed_emit_opportunities++;
-            }
-            was_empty_on_last_update = true;
-            return;
-        }
+                was_empty_on_last_update = true;
+            } else if (was_empty_on_last_update && received_server_states.size() < 2) {
 
-        // if buffer had been empty, wait until we have at least 2 elements
-        if (was_empty_on_last_update && received_server_states.size() < 2) {
-            if (quantized_output_signal.enough_time_has_passed()) {
                 global_logger.debug("would've emitted a signal but the received states only has one element after "
                                     "being empty waiting for 2 before we "
                                     "get started emitting again");
 
                 missed_emit_opportunities++;
-            }
-            return;
-        }
+            } else {
 
-        if (quantized_output_signal.process_and_get_signal()) {
+                auto first = received_server_states.front();
+                emitted_value = first;
+                received_server_states.pop_front();
+                global_logger.debug("size is now: {}", received_server_states.size());
+            }
+            if (emitted_value == std::nullopt) {
+                global_logger.debug("emitting empty");
+            } else {
+                global_logger.debug("emitting value now");
+            }
             global_logger.debug("emitting now");
-            auto first = received_server_states.front();
-            output_emitter.emit(first);
-            received_server_states.pop_front();
+            output_emitter.emit(emitted_value);
         }
     }
 
