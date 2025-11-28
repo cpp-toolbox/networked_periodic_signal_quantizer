@@ -100,7 +100,7 @@
  */
 template <typename T> class NetworkedPeriodicSignalQuantizer {
   public:
-    explicit NetworkedPeriodicSignalQuantizer() : was_empty_on_last_update(false) {}
+    explicit NetworkedPeriodicSignalQuantizer() {}
 
     std::deque<T> received_server_states;
 
@@ -118,6 +118,9 @@ template <typename T> class NetworkedPeriodicSignalQuantizer {
 
     bool pushed_first_element = false;
     bool logging_enabled = false;
+
+    // NOTE: the higher this is the more delay there will be
+    unsigned int num_states_to_wait_for_after_empty = 3;
 
     math_utils::ExponentialMovingAverage average_received_server_states_size;
 
@@ -147,6 +150,8 @@ template <typename T> class NetworkedPeriodicSignalQuantizer {
     void update() {
         LogSection _(global_logger, "npsq update", logging_enabled);
 
+        global_logger.debug("size is now: {}", received_server_states.size());
+
         if (not pushed_first_element)
             return;
 
@@ -161,20 +166,21 @@ template <typename T> class NetworkedPeriodicSignalQuantizer {
                 global_logger.debug("would've emitted a signal but the received states was empty, this is suboptimal "
                                     "because we won't be emitting the signal");
                 missed_emit_opportunities++;
-                was_empty_on_last_update = true;
-            } else if (was_empty_on_last_update && received_server_states.size() < 2) {
+                need_to_get_more_states = true;
+            } else if (need_to_get_more_states && received_server_states.size() < num_states_to_wait_for_after_empty) {
 
                 global_logger.debug("would've emitted a signal but the received states only has one element after "
-                                    "being empty waiting for 2 before we "
-                                    "get started emitting again");
+                                    "being empty waiting for {} before we "
+                                    "get started emitting again",
+                                    num_states_to_wait_for_after_empty);
 
                 missed_emit_opportunities++;
-            } else {
-
+            } else { // implies that received_server_states.size() == num_states_to_wait_for_after_empty or not
+                     // need_to_get_more_states
                 auto first = received_server_states.front();
                 emitted_value = first;
                 received_server_states.pop_front();
-                global_logger.debug("size is now: {}", received_server_states.size());
+                global_logger.debug("just popped, size is now: {}", received_server_states.size());
             }
             if (emitted_value == std::nullopt) {
                 global_logger.debug("emitting empty");
@@ -195,7 +201,7 @@ template <typename T> class NetworkedPeriodicSignalQuantizer {
     double get_average_received_server_states_size() const { return average_received_server_states_size.get(); }
 
   private:
-    bool was_empty_on_last_update;
+    bool need_to_get_more_states = true;
     size_t total_emit_opportunities = 0;  // every time enough_time_has_passed()
     size_t missed_emit_opportunities = 0; // times we wanted to emit but couldn't
 
